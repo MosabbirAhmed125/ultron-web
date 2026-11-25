@@ -8,11 +8,12 @@ falling back to WASM.
 
 ## Live Demo & Architecture
 
-[![Live demo on Vercel](https://img.shields.io/badge/Live%20demo-Vercel-black?logo=vercel)](https://ultron-web.vercel.app)
+[![Live demo on Vercel](https://img.shields.io/badge/Live%20demo-Vercel-black?logo=vercel)](https://ultron-sovereign.vercel.app/)
+[![GitHub source](https://img.shields.io/badge/Source-GitHub-181717?logo=github)](https://github.com/MosabbirAhmed125/ultron-web)
 [![Model on Hugging Face](https://img.shields.io/badge/Model-Hugging%20Face-yellow?logo=huggingface)](https://huggingface.co/Mosabbir125/ultron-qwen25-05b-onnx-web)
+[![Persona dataset on Hugging Face](https://img.shields.io/badge/Persona%20dataset-Hugging%20Face-yellow?logo=huggingface)](https://huggingface.co/datasets/MosabbirAhmed125/ultron-persona-dataset)
 
-The Vercel URL is the project's deployment target; availability depends on the
-deployment.
+The application is deployed live on Vercel.
 
 - **Browser-native inference:** `@huggingface/transformers` loads and runs the
   model inside the dedicated [`ultronWorker.js`](src/lib/ultronWorker.js)
@@ -25,7 +26,8 @@ deployment.
 - **Lore grounding:** [`public/lore.json`](public/lore.json) contains keyword-
   matched MCU and *VisionQuest* reference entries. The matching lore snippet is
   added to the system context when relevant; it does not replace conversation
-  history.
+  history. The [Ultron persona dataset](https://huggingface.co/datasets/MosabbirAhmed125/ultron-persona-dataset)
+  is available separately on Hugging Face.
 - **Bounded conversation context:** Generation includes up to five recent
   user/assistant turns (ten non-system messages), plus the system message.
 - **Interactive generation:** Responses stream token-by-token with `TOK/S`
