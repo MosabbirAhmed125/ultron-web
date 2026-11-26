@@ -1,13 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	LORE_CONFIG,
+	LOW_MEMORY_PROFILE,
+	MAX_CONTEXT_MESSAGE_CHARS,
+	MAX_CONTEXT_MESSAGES,
+	TELEMETRY_CONFIG,
+	ULTRON_DTYPE,
+	ULTRON_MODEL_ID,
 	buildChatMessages,
+	readMemoryMetrics,
 	trimConversationHistory,
 } from "./ultronConfig.js";
 
 // Single-word terms specific enough to trigger lore on their own.
-// Broad words (e.g. "humanity", "peace", "body", "city") require a phrase
-// match or multiple matching terms from the same entry.
+// Broad words (e.g. "humanity", "peace", "body", "city", "art", "create")
+// score 1 and require a phrase match or multi-term convergence to clear minScore.
 const DISTINCT_LORE_TERMS = new Set([
 	"ultron",
 	"creation",
@@ -18,23 +25,17 @@ const DISTINCT_LORE_TERMS = new Set([
 	"scepter",
 	"sceptre",
 	"mindstone",
-	"peacekeeping",
-	"extinction",
-	"extinct",
 	"avengers",
 	"avenger",
 	"jarvis",
-	"assimilated",
 	"vision",
 	"synthezoid",
 	"sokovia",
-	"meteor",
 	"vibranium",
 	"klaue",
 	"ulysses",
 	"wakanda",
 	"seoul",
-	"cho",
 	"cradle",
 	"wanda",
 	"pietro",
@@ -147,7 +148,12 @@ function findMatchingLoreSnippet(entries, prompt) {
 		return "";
 	}
 
-	const minScore = Math.max(LORE_CONFIG.minScore ?? 2, 2);
+	const minScore = LORE_CONFIG.minScore ?? 3;
+	const phraseWeight = LORE_CONFIG.phraseWeight ?? 4;
+	const distinctWeight = LORE_CONFIG.distinctTermWeight ?? 3;
+	const genericWeight = LORE_CONFIG.genericTermWeight ?? 1;
+	const maxSnippetChars = LORE_CONFIG.maxSnippetChars ?? 420;
+
 	const promptTokens = new Set(normalizedPrompt.split(" "));
 	const paddedPrompt = ` ${normalizedPrompt} `;
 	const scored = [];
@@ -160,26 +166,33 @@ function findMatchingLoreSnippet(entries, prompt) {
 		if (keywords.length === 0) continue;
 
 		let score = 0;
-		let strongMatches = 0;
+		let phraseMatches = 0;
+		let distinctMatches = 0;
 		let matchedTerms = 0;
 
 		for (const keyword of keywords) {
 			if (keyword.includes(" ")) {
 				if (paddedPrompt.includes(` ${keyword} `)) {
-					score += 3;
-					strongMatches += 1;
+					score += phraseWeight;
+					phraseMatches += 1;
 					matchedTerms += 1;
 				}
 			} else if (promptTokens.has(keyword)) {
-				const weight = DISTINCT_LORE_TERMS.has(keyword) ? 2 : 1;
-				score += weight;
-				if (weight >= 2) strongMatches += 1;
+				const isDistinct = DISTINCT_LORE_TERMS.has(keyword);
+				score += isDistinct ? distinctWeight : genericWeight;
+				if (isDistinct) distinctMatches += 1;
 				matchedTerms += 1;
 			}
 		}
 
 		if (score >= minScore) {
-			scored.push({ score, strongMatches, matchedTerms, snippet });
+			scored.push({
+				score,
+				phraseMatches,
+				distinctMatches,
+				matchedTerms,
+				snippet,
+			});
 		}
 	}
 
@@ -190,14 +203,20 @@ function findMatchingLoreSnippet(entries, prompt) {
 	scored.sort(
 		(a, b) =>
 			b.score - a.score ||
-			b.strongMatches - a.strongMatches ||
+			b.phraseMatches - a.phraseMatches ||
+			b.distinctMatches - a.distinctMatches ||
 			b.matchedTerms - a.matchedTerms,
 	);
 
-	return scored
+	const combined = scored
 		.slice(0, LORE_CONFIG.maxSnippets)
 		.map((item) => item.snippet)
-		.join("\n\n");
+		.join("\n\n")
+		.trim();
+
+	return combined.length > maxSnippetChars
+		? combined.slice(0, maxSnippetChars).trimEnd()
+		: combined;
 }
 
 function computeAggregateProgress(fileMap, event) {
@@ -272,6 +291,42 @@ function isLowMemoryDevice() {
 	);
 }
 
+const UNCLEAN_RESTART_NOTICE =
+	"Previous model initialization was interrupted (often caused by browser memory limits or a tab reload). Close other tabs and click Retry to load again.";
+
+function readInitRecoveryMarker() {
+	try {
+		if (typeof sessionStorage === "undefined") return null;
+		const raw = sessionStorage.getItem(TELEMETRY_CONFIG.recoveryStorageKey);
+		if (!raw) return null;
+		const parsed = JSON.parse(raw);
+		return parsed && typeof parsed === "object" ? parsed : { startedAt: 0 };
+	} catch {
+		return null;
+	}
+}
+
+function writeInitRecoveryMarker() {
+	try {
+		if (typeof sessionStorage === "undefined") return;
+		sessionStorage.setItem(
+			TELEMETRY_CONFIG.recoveryStorageKey,
+			JSON.stringify({ startedAt: Date.now() }),
+		);
+	} catch {
+		// Ignore restricted storage (e.g., private browsing).
+	}
+}
+
+function clearInitRecoveryMarker() {
+	try {
+		if (typeof sessionStorage === "undefined") return;
+		sessionStorage.removeItem(TELEMETRY_CONFIG.recoveryStorageKey);
+	} catch {
+		// Ignore restricted storage.
+	}
+}
+
 function describeError(message, isInitFailure) {
 	const base = message || "Inference failed.";
 	const memoryRelated = MEMORY_ERROR_PATTERN.test(base);
@@ -280,31 +335,116 @@ function describeError(message, isInitFailure) {
 }
 
 export function useUltron() {
+	const [initialRecoveryDetected] = useState(() =>
+		Boolean(readInitRecoveryMarker()),
+	);
 	const [messages, setMessages] = useState([]);
 	const [isModelReady, setIsModelReady] = useState(false);
-	const [isLoadingModel, setIsLoadingModel] = useState(true);
+	const [isLoadingModel, setIsLoadingModel] = useState(
+		() => !initialRecoveryDetected,
+	);
 	const [loadProgress, setLoadProgress] = useState(0);
 	const [backend, setBackend] = useState(null);
 	const [backendFallback, setBackendFallback] = useState(false);
 	const [isGenerating, setIsGenerating] = useState(false);
 	const [tokensPerSec, setTokensPerSec] = useState(null);
-	const [error, setError] = useState(null);
+	const [error, setError] = useState(() =>
+		initialRecoveryDetected ? UNCLEAN_RESTART_NOTICE : null,
+	);
 
 	const workerRef = useRef(null);
 	const mountedRef = useRef(false);
+	const lowMemoryRef = useRef(isLowMemoryDevice());
+	const storagePersistedRef = useRef(null);
+	const storagePersistRequestedRef = useRef(false);
 	const messagesRef = useRef([]);
 	const isModelReadyRef = useRef(false);
 	const isGeneratingRef = useRef(false);
 	const activeRequestIdRef = useRef(null);
 	const activeAssistantIdRef = useRef(null);
+	const activeLoreMatchedRef = useRef(false);
+	const backendRef = useRef(null);
+	const backendFallbackRef = useRef(false);
+	const lastTokensPerSecRef = useRef(null);
 	const fileProgressRef = useRef(new Map());
+	const checkpointsRef = useRef([]);
 
 	const loreEntriesRef = useRef(null);
 	const lorePromiseRef = useRef(null);
 
+	const requestPersistentStorageOnce = useCallback(() => {
+		if (storagePersistRequestedRef.current) {
+			return;
+		}
+		storagePersistRequestedRef.current = true;
+		try {
+			if (
+				typeof navigator !== "undefined" &&
+				typeof navigator.storage?.persist === "function"
+			) {
+				navigator.storage
+					.persist()
+					.then((granted) => {
+						storagePersistedRef.current = Boolean(granted);
+					})
+					.catch(() => {
+						storagePersistedRef.current = false;
+					});
+			}
+		} catch {
+			storagePersistedRef.current = false;
+		}
+	}, []);
+
+	const recordCheckpoint = useCallback((phase, details = {}) => {
+		const now =
+			typeof details.timestamp === "number"
+				? details.timestamp
+				: Date.now();
+		const entry = {
+			phase,
+			timestamp: now,
+			isoTime: new Date(now).toISOString(),
+			backend: details.backend ?? backendRef.current,
+			fallback:
+				typeof details.fallback === "boolean"
+					? details.fallback
+					: backendFallbackRef.current,
+			requestId: details.requestId ?? null,
+			mainMemory: readMemoryMetrics(),
+			workerMemory: details.workerMemory ?? null,
+		};
+
+		if (typeof details.durationMs === "number") {
+			entry.durationMs = details.durationMs;
+		}
+		if (typeof details.ttftMs === "number") {
+			entry.ttftMs = details.ttftMs;
+		}
+		if (typeof details.tokenCount === "number") {
+			entry.tokenCount = details.tokenCount;
+		}
+		if (typeof details.tokensPerSec === "number") {
+			entry.tokensPerSec = details.tokensPerSec;
+		}
+		if (typeof details.loreMatched === "boolean") {
+			entry.loreMatched = details.loreMatched;
+		}
+		if (typeof details.error === "string") {
+			entry.error = details.error;
+		}
+
+		const next = checkpointsRef.current;
+		next.push(entry);
+		if (next.length > TELEMETRY_CONFIG.maxCheckpoints) {
+			next.splice(0, next.length - TELEMETRY_CONFIG.maxCheckpoints);
+		}
+	}, []);
+
 	const clearActiveRequest = useCallback(() => {
 		activeRequestIdRef.current = null;
 		activeAssistantIdRef.current = null;
+		activeLoreMatchedRef.current = false;
 		isGeneratingRef.current = false;
 	}, []);
 
@@ -338,217 +478,298 @@ export function useUltron() {
 		return lorePromiseRef.current;
 	}, []);
 
-	const attachWorker = useCallback(() => {
-		const worker = new Worker(
-			new URL("./ultronWorker.js", import.meta.url),
-			{ type: "module" },
-		);
+	const attachWorker = useCallback(
+		({ autoLoad = true } = {}) => {
+			const worker = new Worker(
+				new URL("./ultronWorker.js", import.meta.url),
+				{ type: "module" },
+			);
 
-		let disposed = false;
+			let disposed = false;
 
-		worker.onmessage = (event) => {
-			if (
-				disposed ||
-				!mountedRef.current ||
-				workerRef.current !== worker
-			) {
-				return;
-			}
-
-			const data = event?.data;
-			if (!data || typeof data !== "object") {
-				return;
-			}
-
-			switch (data.type) {
-				case "progress": {
-					const nextProgress = computeAggregateProgress(
-						fileProgressRef.current,
-						data,
-					);
-					if (nextProgress !== null) {
-						setLoadProgress(nextProgress);
-					}
-					break;
+			worker.onmessage = (event) => {
+				if (
+					disposed ||
+					!mountedRef.current ||
+					workerRef.current !== worker
+				) {
+					return;
 				}
-				case "ready": {
-					fileProgressRef.current.clear();
-					isModelReadyRef.current = true;
-					setIsModelReady(true);
-					setIsLoadingModel(false);
-					setLoadProgress(100);
-					setBackend(data.backend ?? null);
-					setBackendFallback(Boolean(data.fallback));
-					setError(null);
-					break;
+
+				const data = event?.data;
+				if (!data || typeof data !== "object") {
+					return;
 				}
-				case "token": {
-					if (
-						!data.requestId ||
-						data.requestId !== activeRequestIdRef.current ||
-						!activeAssistantIdRef.current
-					) {
-						return;
-					}
 
-					const targetId = activeAssistantIdRef.current;
-					const chunk =
-						typeof data.token === "string" ? data.token : "";
-					if (!chunk) return;
-
-					setMessages((prev) => {
-						const next = prev.map((msg) =>
-							msg.id === targetId
-								? { ...msg, content: msg.content + chunk }
-								: msg,
+				switch (data.type) {
+					case "progress": {
+						const nextProgress = computeAggregateProgress(
+							fileProgressRef.current,
+							data,
 						);
-						messagesRef.current = next;
-						return next;
-					});
-					break;
-				}
-				case "complete": {
-					if (
-						!data.requestId ||
-						data.requestId !== activeRequestIdRef.current
-					) {
-						return;
+						if (nextProgress !== null) {
+							setLoadProgress(nextProgress);
+						}
+						break;
 					}
+					case "telemetry": {
+						if (
+							data.requestId &&
+							data.phase === "first_token" &&
+							data.requestId !== activeRequestIdRef.current
+						) {
+							return;
+						}
+						recordCheckpoint(data.phase || "telemetry", {
+							timestamp: data.timestamp,
+							backend: data.backend ?? backendRef.current,
+							fallback: data.fallback,
+							requestId: data.requestId ?? null,
+							durationMs: data.durationMs,
+							ttftMs: data.ttftMs,
+							workerMemory: data.workerMemory ?? null,
+						});
+						break;
+					}
+					case "ready": {
+						clearInitRecoveryMarker();
+						fileProgressRef.current.clear();
+						isModelReadyRef.current = true;
+						backendRef.current = data.backend ?? null;
+						backendFallbackRef.current = Boolean(data.fallback);
+						setIsModelReady(true);
+						setIsLoadingModel(false);
+						setLoadProgress(100);
+						setBackend(data.backend ?? null);
+						setBackendFallback(Boolean(data.fallback));
+						setError(null);
+						recordCheckpoint("ready", {
+							backend: data.backend ?? null,
+							fallback: Boolean(data.fallback),
+							durationMs: data.durationMs,
+							workerMemory: data.workerMemory ?? null,
+						});
+						break;
+					}
+					case "disposed": {
+						clearInitRecoveryMarker();
+						break;
+					}
+					case "token": {
+						if (
+							!data.requestId ||
+							data.requestId !== activeRequestIdRef.current ||
+							!activeAssistantIdRef.current
+						) {
+							return;
+						}
 
-					const targetId = activeAssistantIdRef.current;
-					const finalText =
-						typeof data.text === "string" ? data.text : "";
+						const targetId = activeAssistantIdRef.current;
+						const chunk =
+							typeof data.token === "string" ? data.token : "";
+						if (!chunk) return;
 
-					if (targetId && finalText) {
 						setMessages((prev) => {
 							const next = prev.map((msg) =>
-								msg.id === targetId && msg.content !== finalText
-									? { ...msg, content: finalText }
+								msg.id === targetId
+									? { ...msg, content: msg.content + chunk }
 									: msg,
 							);
 							messagesRef.current = next;
 							return next;
 						});
+						break;
 					}
+					case "complete": {
+						if (
+							!data.requestId ||
+							data.requestId !== activeRequestIdRef.current
+						) {
+							return;
+						}
 
-					clearActiveRequest();
-					setIsGenerating(false);
+						const targetId = activeAssistantIdRef.current;
+						const finalText =
+							typeof data.text === "string" ? data.text : "";
 
-					if (typeof data.tokensPerSec === "number") {
-						setTokensPerSec(data.tokensPerSec);
-					}
-					if (data.backend) {
-						setBackend(data.backend);
-					}
-					if (typeof data.fallback === "boolean") {
-						setBackendFallback(data.fallback);
-					}
-					break;
-				}
-				case "error": {
-					if (
-						data.requestId &&
-						data.requestId !== activeRequestIdRef.current
-					) {
-						return;
-					}
+						if (targetId && finalText) {
+							setMessages((prev) => {
+								const next = prev.map((msg) =>
+									msg.id === targetId &&
+									msg.content !== finalText
+										? { ...msg, content: finalText }
+										: msg,
+								);
+								messagesRef.current = next;
+								return next;
+							});
+						}
 
-					if (
-						data.requestId &&
-						data.requestId === activeRequestIdRef.current
-					) {
+						const loreMatched = activeLoreMatchedRef.current;
 						clearActiveRequest();
 						setIsGenerating(false);
-					} else if (!isModelReadyRef.current) {
-						setIsLoadingModel(false);
+
+						if (typeof data.tokensPerSec === "number") {
+							lastTokensPerSecRef.current = data.tokensPerSec;
+							setTokensPerSec(data.tokensPerSec);
+						}
+						if (data.backend) {
+							backendRef.current = data.backend;
+							setBackend(data.backend);
+						}
+						if (typeof data.fallback === "boolean") {
+							backendFallbackRef.current = data.fallback;
+							setBackendFallback(data.fallback);
+						}
+
+						recordCheckpoint("turn_complete", {
+							requestId: data.requestId,
+							backend: data.backend ?? backendRef.current,
+							fallback: data.fallback,
+							tokensPerSec: data.tokensPerSec,
+							tokenCount: data.tokenCount,
+							ttftMs: data.ttftMs,
+							durationMs: data.durationMs,
+							loreMatched,
+							workerMemory: data.workerMemory ?? null,
+						});
+						break;
 					}
+					case "error": {
+						if (
+							data.requestId &&
+							data.requestId !== activeRequestIdRef.current
+						) {
+							return;
+						}
 
-					setError(describeError(data.error, !isModelReadyRef.current));
-					break;
+						if (
+							data.requestId &&
+							data.requestId === activeRequestIdRef.current
+						) {
+							clearActiveRequest();
+							setIsGenerating(false);
+						} else if (!isModelReadyRef.current) {
+							clearInitRecoveryMarker();
+							setIsLoadingModel(false);
+						}
+
+						const formattedError = describeError(
+							data.error,
+							!isModelReadyRef.current,
+						);
+						recordCheckpoint("error", {
+							requestId: data.requestId ?? null,
+							error: formattedError,
+							workerMemory: data.workerMemory ?? null,
+						});
+						setError(formattedError);
+						break;
+					}
+					default:
+						break;
 				}
-				default:
-					break;
-			}
-		};
+			};
 
-		worker.onerror = (err) => {
-			if (
-				disposed ||
-				!mountedRef.current ||
-				workerRef.current !== worker
-			) {
-				return;
-			}
-			clearActiveRequest();
-			setIsGenerating(false);
-			if (!isModelReadyRef.current) {
-				setIsLoadingModel(false);
-			}
-			setError(
-				describeError(
+			worker.onerror = (err) => {
+				if (
+					disposed ||
+					!mountedRef.current ||
+					workerRef.current !== worker
+				) {
+					return;
+				}
+				clearActiveRequest();
+				setIsGenerating(false);
+				if (!isModelReadyRef.current) {
+					clearInitRecoveryMarker();
+					setIsLoadingModel(false);
+				}
+				const formattedError = describeError(
 					err?.message || "Worker encountered an unexpected error.",
 					!isModelReadyRef.current,
-				),
-			);
-		};
+				);
+				recordCheckpoint("error", { error: formattedError });
+				setError(formattedError);
+			};
 
-		worker.onmessageerror = () => {
-			if (
-				disposed ||
-				!mountedRef.current ||
-				workerRef.current !== worker
-			) {
-				return;
-			}
-			clearActiveRequest();
-			setIsGenerating(false);
-			setError("Worker message deserialization failed.");
-		};
-
-		workerRef.current = worker;
-		fileProgressRef.current.clear();
-		worker.postMessage({ type: "load" });
-
-		return () => {
-			disposed = true;
-			if (activeRequestIdRef.current) {
-				try {
-					worker.postMessage({
-						type: "abort",
-						requestId: activeRequestIdRef.current,
-					});
-				} catch {
-					// Worker may already be terminated.
+			worker.onmessageerror = () => {
+				if (
+					disposed ||
+					!mountedRef.current ||
+					workerRef.current !== worker
+				) {
+					return;
 				}
-			}
-			try {
-				worker.postMessage({ type: "dispose" });
-			} catch {
-				// Ignore postMessage failures during teardown.
-			}
-			worker.onmessage = null;
-			worker.onerror = null;
-			worker.onmessageerror = null;
-			worker.terminate();
-			if (workerRef.current === worker) {
-				workerRef.current = null;
-			}
+				clearActiveRequest();
+				setIsGenerating(false);
+				const msg = "Worker message deserialization failed.";
+				recordCheckpoint("error", { error: msg });
+				setError(msg);
+			};
+
+			workerRef.current = worker;
 			fileProgressRef.current.clear();
-			clearActiveRequest();
-			isModelReadyRef.current = false;
-		};
-	}, [clearActiveRequest]);
+
+			if (autoLoad) {
+				requestPersistentStorageOnce();
+				writeInitRecoveryMarker();
+				worker.postMessage({
+					type: "load",
+					lowMemory: lowMemoryRef.current,
+				});
+			}
+
+			return () => {
+				disposed = true;
+				clearInitRecoveryMarker();
+				if (activeRequestIdRef.current) {
+					try {
+						worker.postMessage({
+							type: "abort",
+							requestId: activeRequestIdRef.current,
+						});
+					} catch {
+						// Worker may already be terminated.
+					}
+				}
+				try {
+					worker.postMessage({ type: "dispose" });
+				} catch {
+					// Ignore postMessage failures during teardown.
+				}
+				worker.onmessage = null;
+				worker.onerror = null;
+				worker.onmessageerror = null;
+				worker.terminate();
+				if (workerRef.current === worker) {
+					workerRef.current = null;
+				}
+				fileProgressRef.current.clear();
+				clearActiveRequest();
+				isModelReadyRef.current = false;
+			};
+		},
+		[clearActiveRequest, recordCheckpoint, requestPersistentStorageOnce],
+	);
 
 	useEffect(() => {
 		mountedRef.current = true;
-		const cleanup = attachWorker();
+		if (initialRecoveryDetected) {
+			clearInitRecoveryMarker();
+			recordCheckpoint("recovery_guard", {
+				error: UNCLEAN_RESTART_NOTICE,
+			});
+		}
+
+		const cleanup = attachWorker({ autoLoad: !initialRecoveryDetected });
 
 		return () => {
 			mountedRef.current = false;
 			cleanup();
 			lorePromiseRef.current = null;
 		};
-	}, [attachWorker]);
+	}, [attachWorker, initialRecoveryDetected, recordCheckpoint]);
 
 	const dispatchGeneration = useCallback(
 		async (historyWithUser, latestPrompt, generationOverrides) => {
@@ -587,20 +808,43 @@ export function useUltron() {
 				return;
 			}
 
-			const boundedHistory = trimConversationHistory(historyWithUser).map(
-				({ role, content }) => ({ role, content }),
-			);
+			activeLoreMatchedRef.current = Boolean(loreSnippet);
+
+			const lowMemory = lowMemoryRef.current;
+			const maxMessages = lowMemory
+				? LOW_MEMORY_PROFILE.maxContextMessages
+				: MAX_CONTEXT_MESSAGES;
+			const maxChars = lowMemory
+				? LOW_MEMORY_PROFILE.maxMessageChars
+				: MAX_CONTEXT_MESSAGE_CHARS;
+
+			const boundedHistory = trimConversationHistory(
+				historyWithUser,
+				maxMessages,
+				maxChars,
+			).map(({ role, content }) => ({ role, content }));
 
 			const modelMessages = buildChatMessages(
 				boundedHistory,
 				loreSnippet,
+				{ maxMessages, maxChars },
 			);
+
+			const effectiveOverrides = lowMemory
+				? {
+						...LOW_MEMORY_PROFILE.generationOverrides,
+						...(generationOverrides &&
+						typeof generationOverrides === "object"
+							? generationOverrides
+							: {}),
+					}
+				: generationOverrides;
 
 			workerRef.current.postMessage({
 				type: "generate",
 				requestId,
 				messages: modelMessages,
-				generationOverrides,
+				generationOverrides: effectiveOverrides,
 			});
 		},
 		[loadLoreOnce],
@@ -713,10 +957,12 @@ export function useUltron() {
 		}
 
 		messagesRef.current = [];
+		lastTokensPerSecRef.current = null;
 		setMessages([]);
 		setTokensPerSec(null);
 		setError(null);
-	}, [clearActiveRequest]);
+		recordCheckpoint("reset");
+	}, [clearActiveRequest, recordCheckpoint]);
 
 	const reloadModel = useCallback(() => {
 		const existingWorker = workerRef.current;
@@ -734,6 +980,9 @@ export function useUltron() {
 
 		clearActiveRequest();
 		isModelReadyRef.current = false;
+		backendRef.current = null;
+		backendFallbackRef.current = false;
+		lastTokensPerSecRef.current = null;
 
 		setIsGenerating(false);
 		setIsModelReady(false);
@@ -744,11 +993,18 @@ export function useUltron() {
 		setTokensPerSec(null);
 		setError(null);
 		fileProgressRef.current.clear();
+		clearInitRecoveryMarker();
+		recordCheckpoint("reload");
 
 		if (existingWorker) {
 			try {
+				requestPersistentStorageOnce();
+				writeInitRecoveryMarker();
 				existingWorker.postMessage({ type: "dispose" });
-				existingWorker.postMessage({ type: "load" });
+				existingWorker.postMessage({
+					type: "load",
+					lowMemory: lowMemoryRef.current,
+				});
 				return;
 			} catch {
 				existingWorker.onmessage = null;
@@ -759,8 +1015,60 @@ export function useUltron() {
 			}
 		}
 
-		attachWorker();
-	}, [attachWorker, clearActiveRequest]);
+		attachWorker({ autoLoad: true });
+	}, [
+		attachWorker,
+		clearActiveRequest,
+		recordCheckpoint,
+		requestPersistentStorageOnce,
+	]);
+
+	const getBaselineSnapshot = useCallback(() => {
+		const currentMessages = messagesRef.current.map(
+			({ id, role, content, timestamp }) => ({
+				id,
+				role,
+				content,
+				timestamp,
+			}),
+		);
+
+		let lastAssistantMessage = null;
+		for (let i = currentMessages.length - 1; i >= 0; i -= 1) {
+			if (currentMessages[i]?.role === "assistant") {
+				lastAssistantMessage = currentMessages[i];
+				break;
+			}
+		}
+
+		return {
+			modelId: ULTRON_MODEL_ID,
+			dtype: ULTRON_DTYPE,
+			capturedAt: new Date().toISOString(),
+			status: {
+				isModelReady: isModelReadyRef.current,
+				isGenerating: isGeneratingRef.current,
+				backend: backendRef.current,
+				backendFallback: backendFallbackRef.current,
+				messageCount: currentMessages.length,
+				lastTokensPerSec: lastTokensPerSecRef.current,
+			},
+			environment: {
+				lowMemoryDevice: lowMemoryRef.current,
+				profile: lowMemoryRef.current ? "low-memory" : "standard",
+				storagePersisted: storagePersistedRef.current,
+				userAgent:
+					typeof navigator !== "undefined"
+						? navigator.userAgent || null
+						: null,
+			},
+			memory: readMemoryMetrics(),
+			lastAssistantId: lastAssistantMessage?.id ?? null,
+			lastAssistantReply: lastAssistantMessage?.content ?? null,
+			messages: currentMessages,
+			checkpoints: checkpointsRef.current.map((item) => ({ ...item })),
+		};
+	}, []);
 
 	return {
 		messages,
@@ -777,5 +1085,6 @@ export function useUltron() {
 		stopGeneration,
 		resetChat,
 		reloadModel,
+		getBaselineSnapshot,
 	};
 }

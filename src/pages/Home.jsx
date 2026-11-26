@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Activity, Cpu, Gauge, Layers, Zap } from "lucide-react";
 import { useUltron } from "../lib/useUltron.js";
-import { STARTER_PROMPTS } from "../lib/ultronConfig.js";
+import { STARTER_PROMPTS, TELEMETRY_CONFIG } from "../lib/ultronConfig.js";
 import { cn } from "../lib/cn.js";
 import LoadingOverlay from "../components/LoadingOverlay.jsx";
 import UltronPanel from "../components/UltronPanel.jsx";
@@ -31,8 +31,28 @@ export default function Home() {
 		stopGeneration,
 		resetChat,
 		reloadModel,
+		getBaselineSnapshot,
 	} = useUltron();
 	const [inputValue, setInputValue] = useState("");
+
+	useEffect(() => {
+		if (typeof window === "undefined") return undefined;
+		const key = TELEMETRY_CONFIG.globalKey;
+		const api = Object.freeze({
+			getSnapshot: () => getBaselineSnapshot(),
+			getCheckpoints: () => getBaselineSnapshot().checkpoints,
+			getMessages: () => getBaselineSnapshot().messages,
+			getLastAssistantReply: () =>
+				getBaselineSnapshot().lastAssistantReply,
+			exportJSON: () => JSON.stringify(getBaselineSnapshot(), null, 2),
+		});
+		window[key] = api;
+		return () => {
+			if (window[key] === api) {
+				delete window[key];
+			}
+		};
+	}, [getBaselineSnapshot]);
 
 	const canSend = isModelReady && !isGenerating;
 

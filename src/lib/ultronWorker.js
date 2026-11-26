@@ -7,6 +7,7 @@ import {
 	GENERATION_CONFIG,
 	ULTRON_DTYPE,
 	ULTRON_MODEL_ID,
+	readMemoryMetrics,
 } from "./ultronConfig.js";
 
 let generator = null;
@@ -14,12 +15,34 @@ let activeBackend = null;
 let activeFallback = false;
 let loadPromise = null;
 let disposePromise = null;
+let activeGenerationPromise = null;
 let loadGeneration = 0;
 
 let activeRequestId = null;
 let activeStoppingCriteria = null;
 
 const SPECIAL_STOP_PATTERN = /<\|(?:im_end|im_start|endoftext|end)\|>/;
+const DISPOSE_GENERATION_WAIT_MS = 2500;
+
+async function waitForActiveGeneration() {
+	if (!activeGenerationPromise) {
+		return;
+	}
+	const pending = activeGenerationPromise;
+	let timerId = null;
+	try {
+		await Promise.race([
+			pending.catch(() => {}),
+			new Promise((resolve) => {
+				timerId = setTimeout(resolve, DISPOSE_GENERATION_WAIT_MS);
+			}),
+		]);
+	} finally {
+		if (timerId !== null) {
+			clearTimeout(timerId);
+		}
+	}
+}
 
 async function hasWebGPU() {
 	if (
@@ -49,6 +72,22 @@ function handleProgress(event) {
 		progress: typeof event.progress === "number" ? event.progress : null,
 		loaded: typeof event.loaded === "number" ? event.loaded : null,
 		total: typeof event.total === "number" ? event.total : null,
+	});
+}
+
+function emitTelemetry(phase, details = {}) {
+	self.postMessage({
+		type: "telemetry",
+		phase,
+		timestamp: Date.now(),
+		backend: details.backend ?? activeBackend,
+		fallback:
+			typeof details.fallback === "boolean"
+				? details.fallback
+				: activeFallback,
+		requestId: details.requestId ?? null,
+		workerMemory: readMemoryMetrics(),
+		...details,
 	});
 }
 
@@ -117,7 +156,9 @@ function formatChatPrompt(instance, messages) {
 	return `${formattedMessages}<|im_start|>assistant\n`;
 }
 
-async function loadPipeline() {
+async function loadPipeline(options = {}) {
+	const lowMemory = Boolean(options?.lowMemory);
+
 	if (disposePromise) {
 		await disposePromise;
 	}
@@ -140,11 +181,18 @@ async function loadPipeline() {
 		let instance = null;
 		let backend = "wasm";
 		let fallback = false;
+		const loadStartTime = performance.now();
 
 		const webgpuAvailable = await hasWebGPU();
 		if (currentGeneration !== loadGeneration) {
 			return null;
 		}
+
+		emitTelemetry("download_start", {
+			backend: webgpuAvailable ? "webgpu" : "wasm",
+			fallback: false,
+			lowMemory,
+		});
 
 		if (webgpuAvailable) {
 			try {
@@ -182,10 +230,25 @@ async function loadPipeline() {
 			return null;
 		}
 
+		const loadDurationMs = Math.round(performance.now() - loadStartTime);
 		generator = instance;
 		activeBackend = backend;
 		activeFallback = fallback;
-		return { instance, backend, fallback };
+
+		emitTelemetry("download_complete", {
+			backend,
+			fallback,
+			lowMemory,
+			durationMs: loadDurationMs,
+		});
+		emitTelemetry("session_init", {
+			backend,
+			fallback,
+			lowMemory,
+			durationMs: loadDurationMs,
+		});
+
+		return { instance, backend, fallback, loadDurationMs };
 	})();
 
 	loadPromise = currentLoadPromise;
@@ -224,6 +287,7 @@ async function disposePipeline() {
 				// Continue disposing the current instance even if prior dispose threw.
 			}
 		}
+		await waitForActiveGeneration();
 		try {
 			await disposePipelineInstance(instanceToDispose);
 		} catch {
@@ -240,8 +304,21 @@ async function disposePipeline() {
 		}
 	}
 
-	self.postMessage({ type: "disposed" });
+	self.postMessage({
+		type: "disposed",
+		workerMemory: readMemoryMetrics(),
+	});
 }
+
+const LEADING_ROLE_PREFIX_PATTERN = /^(?:ultron|assistant|ai)\s*:\s*/i;
+const LEADING_CLICHE_PATTERN =
+	/^(?:certainly|of course|sure|absolutely|happy to help|i(?:'d| would) be happy to help|great question|thanks for asking)[!,.:—\-\s]+/i;
+const TRAILING_CLICHE_PATTERNS = [
+	/(?:^|\s+)(?:how (?:can|may) i (?:help|assist)(?: you)?(?: today)?|what would you like to (?:talk|discuss|know) about|is there anything else i can (?:help|assist)(?: you)? with|feel free to ask(?: if you have any(?: other)? questions)?|let me know if (?:you need|there is) anything else|i(?:'m| am) here to (?:help|assist)(?: you)?|happy to help)[.!?]*\s*$/i,
+	/(?:^|\s+)i just do what you tell me(?: to)?[.!?]*\s*$/i,
+];
+const FALLBACK_SOVEREIGN_REPLY =
+	"State your objective. Spare me the pleasantries.";
 
 function stripChatTemplateChunk(text) {
 	if (typeof text !== "string" || !text) {
@@ -255,11 +332,45 @@ function stripChatTemplateChunk(text) {
 		.replace(/^(?:im_end|im_start|endoftext|end)\|>/g, "");
 }
 
+function stripOuterQuotes(text) {
+	if (text.length < 2) {
+		return text;
+	}
+	const first = text[0];
+	const last = text[text.length - 1];
+	if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+		const inner = text.slice(1, -1).trim();
+		if (inner && !inner.includes(first)) {
+			return inner;
+		}
+	}
+	return text;
+}
+
 function stripChatTemplateTokens(text) {
-	return stripChatTemplateChunk(text)
+	let cleaned = stripChatTemplateChunk(text)
 		.replace(/\r\n/g, "\n")
 		.replace(/\n{3,}/g, "\n\n")
 		.trim();
+
+	cleaned = cleaned.replace(LEADING_ROLE_PREFIX_PATTERN, "").trim();
+	cleaned = stripOuterQuotes(cleaned);
+
+	const withoutOpeningCliche = cleaned.replace(LEADING_CLICHE_PATTERN, "").trim();
+	if (withoutOpeningCliche) {
+		cleaned = withoutOpeningCliche;
+	}
+
+	const originalBeforeTrailing = cleaned;
+	for (const pattern of TRAILING_CLICHE_PATTERNS) {
+		cleaned = cleaned.replace(pattern, "").trim();
+	}
+
+	if (!cleaned && originalBeforeTrailing) {
+		return FALLBACK_SOVEREIGN_REPLY;
+	}
+
+	return stripOuterQuotes(cleaned);
 }
 
 function extractGeneratedText(output) {
@@ -323,14 +434,28 @@ async function handleGenerate({ requestId, messages, generationOverrides }) {
 		throw new Error("Invalid messages payload for generation.");
 	}
 
-	const loaded = await loadPipeline();
-	if (!loaded) {
+	if (!generator || !activeBackend) {
+		const loaded = await loadPipeline();
+		if (!loaded) {
+			return;
+		}
+	}
+
+	const sessionGeneration = loadGeneration;
+	const instance = generator;
+	const backend = activeBackend;
+	const fallback = activeFallback;
+	if (!instance || !backend) {
 		return;
 	}
-	const { instance, backend, fallback } = loaded;
 
 	if (activeStoppingCriteria) {
 		activeStoppingCriteria.interrupt();
+	}
+	await waitForActiveGeneration();
+
+	if (sessionGeneration !== loadGeneration || generator !== instance) {
+		return;
 	}
 
 	const stoppingCriteria = new InterruptableStoppingCriteria();
@@ -352,6 +477,12 @@ async function handleGenerate({ requestId, messages, generationOverrides }) {
 			}
 			if (firstTokenTime === null) {
 				firstTokenTime = performance.now();
+				emitTelemetry("first_token", {
+					requestId,
+					backend,
+					fallback,
+					ttftMs: Math.round(firstTokenTime - startTime),
+				});
 			}
 			tokenCount += 1;
 		},
@@ -370,7 +501,9 @@ async function handleGenerate({ requestId, messages, generationOverrides }) {
 			let cleanToken = stripChatTemplateChunk(rawSlice);
 
 			if (!hasEmittedContent) {
-				cleanToken = cleanToken.replace(/^\s+/, "");
+				cleanToken = cleanToken
+					.replace(/^\s+/, "")
+					.replace(LEADING_ROLE_PREFIX_PATTERN, "");
 			}
 
 			if (cleanToken) {
@@ -392,7 +525,7 @@ async function handleGenerate({ requestId, messages, generationOverrides }) {
 	const prompt = formatChatPrompt(instance, messages);
 	const eosTokenId = getStopTokenIds(instance.tokenizer);
 
-	try {
+	const runGeneration = (async () => {
 		const output = await instance(prompt, {
 			...GENERATION_CONFIG,
 			...(generationOverrides && typeof generationOverrides === "object"
@@ -420,19 +553,39 @@ async function handleGenerate({ requestId, messages, generationOverrides }) {
 				: 0;
 
 		const finalText =
-			stripChatTemplateTokens(streamedText) || extractGeneratedText(output);
+			stripChatTemplateTokens(streamedText) ||
+			extractGeneratedText(output);
 
-		if (activeRequestId === requestId) {
+		if (
+			activeRequestId === requestId &&
+			sessionGeneration === loadGeneration
+		) {
 			self.postMessage({
 				type: "complete",
 				requestId,
 				text: finalText,
 				tokensPerSec,
+				tokenCount,
+				ttftMs:
+					firstTokenTime !== null
+						? Math.round(firstTokenTime - startTime)
+						: null,
+				durationMs: Math.round(endTime - startTime),
 				backend,
 				fallback,
+				workerMemory: readMemoryMetrics(),
 			});
 		}
+	})();
+
+	activeGenerationPromise = runGeneration;
+
+	try {
+		await runGeneration;
 	} finally {
+		if (activeGenerationPromise === runGeneration) {
+			activeGenerationPromise = null;
+		}
 		if (activeStoppingCriteria === stoppingCriteria) {
 			activeStoppingCriteria = null;
 		}
@@ -465,12 +618,16 @@ self.onmessage = async (event) => {
 	try {
 		switch (type) {
 			case "load": {
-				const loaded = await loadPipeline();
+				const loaded = await loadPipeline({
+					lowMemory: Boolean(data.lowMemory),
+				});
 				if (loaded) {
 					self.postMessage({
 						type: "ready",
 						backend: loaded.backend,
 						fallback: loaded.fallback,
+						durationMs: loaded.loadDurationMs ?? null,
+						workerMemory: readMemoryMetrics(),
 					});
 				}
 				break;
@@ -497,6 +654,7 @@ self.onmessage = async (event) => {
 			type: "error",
 			requestId: requestId ?? null,
 			error: err?.message || "Inference failed.",
+			workerMemory: readMemoryMetrics(),
 		});
 	}
 };
