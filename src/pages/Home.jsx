@@ -23,6 +23,8 @@ export default function Home() {
 		isLoadingModel,
 		loadProgress,
 		backend,
+		unsupportedDevice,
+		needsDownloadApproval,
 		isGenerating,
 		tokensPerSec,
 		error,
@@ -31,6 +33,7 @@ export default function Home() {
 		stopGeneration,
 		resetChat,
 		reloadModel,
+		approveDownload,
 		getBaselineSnapshot,
 	} = useUltron();
 	const [inputValue, setInputValue] = useState("");
@@ -54,7 +57,11 @@ export default function Home() {
 		};
 	}, [getBaselineSnapshot]);
 
-	const canSend = isModelReady && !isGenerating;
+	const canSend =
+		!unsupportedDevice &&
+		!needsDownloadApproval &&
+		isModelReady &&
+		!isGenerating;
 
 	const send = (text) => {
 		if (!canSend || !text.trim()) return;
@@ -119,11 +126,19 @@ export default function Home() {
 			))}
 
 			<LoadingOverlay
-				isOpen={isLoadingModel || !isModelReady}
+				isOpen={
+					Boolean(unsupportedDevice) ||
+					needsDownloadApproval ||
+					isLoadingModel ||
+					!isModelReady
+				}
 				progress={loadProgress}
 				backend={backend}
 				error={initError}
-				onRetry={reloadModel}
+				unsupported={unsupportedDevice}
+				needsApproval={needsDownloadApproval}
+				onApproveDownload={approveDownload}
+				onRetry={unsupportedDevice ? undefined : reloadModel}
 			/>
 
 			{/* Desktop peripheral header */}

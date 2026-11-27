@@ -1,5 +1,11 @@
 import { AnimatePresence, motion } from "motion/react";
-import { AlertTriangle, Cpu, RotateCcw } from "lucide-react";
+import {
+	AlertTriangle,
+	Cpu,
+	Download,
+	MonitorOff,
+	RotateCcw,
+} from "lucide-react";
 import { cn } from "../lib/cn.js";
 import ultronSvg from "../assets/ultron.svg";
 
@@ -21,12 +27,18 @@ export default function LoadingOverlay({
 	progress = 0,
 	backend = null,
 	error = null,
+	unsupported = null,
+	needsApproval = false,
+	onApproveDownload,
 	onRetry,
 }) {
 	const value = Number.isFinite(progress)
 		? Math.min(100, Math.max(0, Math.round(progress)))
 		: 0;
-	const visible = isOpen || Boolean(error);
+	const isUnsupported = Boolean(unsupported);
+	const isBlocked = isUnsupported || Boolean(error);
+	const showApproval = !isUnsupported && needsApproval;
+	const visible = isOpen || isBlocked || showApproval;
 	const label = backend ? backend.toUpperCase() : null;
 
 	return (
@@ -62,7 +74,7 @@ export default function LoadingOverlay({
 						<div
 							className={cn(
 								"relative h-72 w-full overflow-hidden rounded-xl border-2 bg-shark-950 sm:h-80",
-								error
+								isBlocked
 									? "border-red-ribbon-500"
 									: "border-red-ribbon-600/80",
 							)}
@@ -79,12 +91,12 @@ export default function LoadingOverlay({
 										"radial-gradient(circle at 50% 48%, color-mix(in srgb, var(--color-red-ribbon-500) 44%, transparent) 0%, color-mix(in srgb, var(--color-alizarin-crimson-800) 42%, transparent) 48%, transparent 78%)",
 								}}
 								animate={
-									error
-										? { opacity: 0.2 }
+									isBlocked
+										? { opacity: 0.22 }
 										: { opacity: [0.42, 0.9, 0.42] }
 								}
 								transition={
-									error
+									isBlocked
 										? { duration: 0.3 }
 										: {
 												duration: 2.6,
@@ -100,15 +112,15 @@ export default function LoadingOverlay({
 								draggable={false}
 								className="relative z-1 size-full select-none object-cover"
 								animate={
-									error
-										? { opacity: 0.4, scale: 0.97 }
+									isBlocked
+										? { opacity: 0.45, scale: 0.97 }
 										: {
 												opacity: [0.9, 1, 0.9],
 												scale: [1, 1.022, 1],
 											}
 								}
 								transition={
-									error
+									isBlocked
 										? { duration: 0.35, ease: "easeOut" }
 										: {
 												duration: 2.6,
@@ -143,7 +155,7 @@ export default function LoadingOverlay({
 						<div
 							className={cn(
 								"w-full rounded-xl border-2 bg-shark-950/95 p-4 sm:p-5",
-								error
+								isBlocked
 									? "border-red-ribbon-600"
 									: "border-cod-gray-700/90",
 							)}
@@ -164,9 +176,9 @@ export default function LoadingOverlay({
 								</div>
 
 								<AnimatePresence>
-									{label && (
+									{isUnsupported ? (
 										<motion.span
-											key={label}
+											key="unsupported-badge"
 											initial={{
 												opacity: 0,
 												scale: 0.92,
@@ -174,20 +186,158 @@ export default function LoadingOverlay({
 											animate={{ opacity: 1, scale: 1 }}
 											exit={{ opacity: 0, scale: 0.92 }}
 											transition={{ duration: 0.2 }}
-											className="inline-flex items-center gap-1.5 rounded-lg border-2 border-red-ribbon-600/80 bg-red-ribbon-950 px-2.5 py-0.5 font-aquatico text-[10px] tracking-[0.16em] text-red-ribbon-200"
+											className="inline-flex items-center gap-1.5 rounded-lg border-2 border-red-ribbon-600/80 bg-red-ribbon-950 px-2.5 py-0.5 font-phenomena text-[10px] tracking-[0.16em] text-red-ribbon-200"
 										>
-											<Cpu
+											<MonitorOff
 												className="size-3 text-red-ribbon-400"
 												aria-hidden="true"
 											/>
-											{label}
+											UNSUPPORTED
 										</motion.span>
+									) : showApproval ? (
+										<motion.span
+											key="approval-badge"
+											initial={{
+												opacity: 0,
+												scale: 0.92,
+											}}
+											animate={{ opacity: 1, scale: 1 }}
+											exit={{ opacity: 0, scale: 0.92 }}
+											transition={{ duration: 0.2 }}
+											className="inline-flex items-center gap-1.5 rounded-lg border-2 border-red-ribbon-600/80 bg-red-ribbon-950 px-2.5 py-0.5 font-phenomena text-[10px] tracking-[0.16em] text-red-ribbon-200"
+										>
+											<Download
+												className="size-3 text-red-ribbon-400"
+												aria-hidden="true"
+											/>
+											~814.5 MB
+										</motion.span>
+									) : (
+										label && (
+											<motion.span
+												key={label}
+												initial={{
+													opacity: 0,
+													scale: 0.92,
+												}}
+												animate={{
+													opacity: 1,
+													scale: 1,
+												}}
+												exit={{
+													opacity: 0,
+													scale: 0.92,
+												}}
+												transition={{ duration: 0.2 }}
+												className="inline-flex items-center gap-1.5 rounded-lg border-2 border-red-ribbon-600/80 bg-red-ribbon-950 px-2.5 py-0.5 font-aquatico text-[10px] tracking-[0.16em] text-red-ribbon-200"
+											>
+												<Cpu
+													className="size-3 text-red-ribbon-400"
+													aria-hidden="true"
+												/>
+												{label}
+											</motion.span>
+										)
 									)}
 								</AnimatePresence>
 							</div>
 
 							<AnimatePresence mode="wait">
-								{error ? (
+								{isUnsupported ? (
+									<motion.div
+										key="unsupported"
+										initial={{ opacity: 0, y: 6 }}
+										animate={{ opacity: 1, y: 0 }}
+										exit={{ opacity: 0, y: -4 }}
+										transition={{ duration: 0.22 }}
+										className="mt-5 flex flex-col gap-4"
+										role="alert"
+									>
+										<div className="flex items-start gap-3">
+											<MonitorOff
+												className="mt-0.5 size-4 shrink-0 text-red-ribbon-400"
+												aria-hidden="true"
+											/>
+											<div className="min-w-0 flex-1">
+												<p className="font-moon text-xs tracking-[0.14em] text-red-ribbon-400">
+													{unsupported.title ||
+														"UNSUPPORTED DEVICE"}
+												</p>
+												<p className="mt-1.5 wrap-break-word font-ubuntu text-xs font-medium leading-relaxed text-cod-gray-300">
+													{unsupported.reason}
+												</p>
+											</div>
+										</div>
+										<div className="flex items-center justify-between border-t border-cod-gray-800/90 pt-3 font-moon text-[10px] tracking-[0.18em] text-cod-gray-400">
+											<span>
+												{unsupported.requirement
+													? `REQUIREMENT // ${unsupported.requirement}`
+													: "REQUIREMENT // DESKTOP + WEBGPU"}
+											</span>
+											<span className="font-phenomena text-xs font-bold tracking-[0.14em] text-red-ribbon-400">
+												DOWNLOAD BLOCKED
+											</span>
+										</div>
+									</motion.div>
+								) : showApproval ? (
+									<motion.div
+										key="approval"
+										initial={{ opacity: 0, y: 6 }}
+										animate={{ opacity: 1, y: 0 }}
+										exit={{ opacity: 0, y: -4 }}
+										transition={{ duration: 0.22 }}
+										className="mt-5 flex flex-col gap-4"
+									>
+										<div className="flex items-start gap-3">
+											<Download
+												className="mt-0.5 size-4 shrink-0 text-red-ribbon-400"
+												aria-hidden="true"
+											/>
+											<div className="min-w-0 flex-1">
+												<p className="font-moon text-xs tracking-[0.14em] text-red-ribbon-400">
+													LOCAL WEIGHTS REQUIRED
+												</p>
+												<p className="mt-1.5 font-ubuntu text-xs font-medium leading-relaxed text-cod-gray-300">
+													First-time setup downloads
+													~814.5 MB of quantized
+													Qwen2.5-0.5B weights and
+													caches them locally in your
+													browser for instant reuse.
+												</p>
+											</div>
+										</div>
+
+										{onApproveDownload && (
+											<motion.button
+												type="button"
+												onClick={onApproveDownload}
+												whileHover={{
+													y: -1,
+													backgroundColor:
+														"var(--color-red-ribbon-600)",
+													borderColor:
+														"var(--color-red-ribbon-400)",
+												}}
+												whileTap={{ scale: 0.97 }}
+												transition={{ duration: 0.15 }}
+												className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border-2 border-red-ribbon-500 bg-red-ribbon-700 px-4 py-2.5 font-moon text-sm font-bold tracking-[0.2em] text-cod-gray-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-ribbon-400"
+											>
+												<Download
+													className="size-4"
+													aria-hidden="true"
+												/>
+												DOWNLOAD &amp; INITIALIZE
+											</motion.button>
+										)}
+
+										<div className="flex items-center justify-between border-t border-cod-gray-800/90 pt-3 font-moon text-[10px] tracking-[0.18em] text-cod-gray-400">
+											<span>CACHE // NOT DETECTED</span>
+											<span className="font-phenomena text-xs font-bold tracking-[0.14em] text-cod-gray-300 tabular-nums">
+												QWEN2.5-0.5B Q4
+											</span>
+										</div>
+									</motion.div>
+								) : error ? (
 									<motion.div
 										key="error"
 										initial={{ opacity: 0, y: 6 }}

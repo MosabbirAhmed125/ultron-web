@@ -291,6 +291,88 @@ function isLowMemoryDevice() {
 	);
 }
 
+function detectUnsupportedDeviceSync() {
+	if (typeof window === "undefined" || typeof navigator === "undefined") {
+		return null;
+	}
+
+	const ua = navigator.userAgent || "";
+	const isMobileOrTabletUA =
+		navigator.userAgentData?.mobile === true ||
+		/Android|iPhone|iPad|iPod|Mobile|Tablet|IEMobile|Opera Mini/i.test(ua) ||
+		(navigator.platform === "MacIntel" &&
+			typeof navigator.maxTouchPoints === "number" &&
+			navigator.maxTouchPoints > 1);
+
+	let isCoarseSmallViewport = false;
+	try {
+		isCoarseSmallViewport =
+			Boolean(window.matchMedia?.("(pointer: coarse)")?.matches) &&
+			window.innerWidth < 1024;
+	} catch {
+		// Default remains false when matchMedia is unavailable.
+	}
+
+	if (isMobileOrTabletUA || isCoarseSmallViewport) {
+		return {
+			code: "NON_DESKTOP",
+			title: "DESKTOP DEVICE REQUIRED",
+			reason: "Ultron runs a local ~814.5 MB neural core in-browser. Mobile and tablet devices are not supported—open this app on a desktop or laptop browser.",
+			requirement: "DESKTOP + WEBGPU",
+		};
+	}
+
+	if (typeof Worker === "undefined" || typeof WebAssembly === "undefined") {
+		return {
+			code: "RUNTIME_UNSUPPORTED",
+			title: "UNSUPPORTED BROWSER RUNTIME",
+			reason: "This browser lacks Web Worker or WebAssembly support required to run Ultron locally. Model download was blocked.",
+			requirement: "MODERN DESKTOP BROWSER",
+		};
+	}
+
+	if (
+		!("gpu" in navigator) ||
+		typeof navigator.gpu?.requestAdapter !== "function"
+	) {
+		return {
+			code: "NO_WEBGPU",
+			title: "WEBGPU REQUIRED",
+			reason: "WebGPU is unavailable in this browser. Use a WebGPU-capable desktop browser (Chrome, Edge, or Safari) so ~814.5 MB of weights are not downloaded unnecessarily.",
+			requirement: "DESKTOP + WEBGPU",
+		};
+	}
+
+	return null;
+}
+
+const TRANSFORMERS_CACHE_NAME = "transformers-cache";
+
+async function isModelCached() {
+	try {
+		if (typeof caches === "undefined" || typeof caches.open !== "function") {
+			return false;
+		}
+		const cache = await caches.open(TRANSFORMERS_CACHE_NAME);
+		const requests = await cache.keys();
+		const modelNeedle = ULTRON_MODEL_ID.toLowerCase();
+		const encodedNeedle = encodeURIComponent(ULTRON_MODEL_ID).toLowerCase();
+
+		for (const request of requests) {
+			const url = (request?.url || "").toLowerCase();
+			if (!url.includes(modelNeedle) && !url.includes(encodedNeedle)) {
+				continue;
+			}
+			if (url.includes(".onnx")) {
+				return true;
+			}
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
 const UNCLEAN_RESTART_NOTICE =
 	"Previous model initialization was interrupted (often caused by browser memory limits or a tab reload). Close other tabs and click Retry to load again.";
 
@@ -335,13 +417,17 @@ function describeError(message, isInitFailure) {
 }
 
 export function useUltron() {
-	const [initialRecoveryDetected] = useState(() =>
-		Boolean(readInitRecoveryMarker()),
+	const [initialUnsupported] = useState(() => detectUnsupportedDeviceSync());
+	const [unsupportedDevice, setUnsupportedDevice] =
+		useState(initialUnsupported);
+	const [needsDownloadApproval, setNeedsDownloadApproval] = useState(false);
+	const [initialRecoveryDetected] = useState(
+		() => !initialUnsupported && Boolean(readInitRecoveryMarker()),
 	);
 	const [messages, setMessages] = useState([]);
 	const [isModelReady, setIsModelReady] = useState(false);
 	const [isLoadingModel, setIsLoadingModel] = useState(
-		() => !initialRecoveryDetected,
+		() => !initialUnsupported && !initialRecoveryDetected,
 	);
 	const [loadProgress, setLoadProgress] = useState(0);
 	const [backend, setBackend] = useState(null);
@@ -349,11 +435,17 @@ export function useUltron() {
 	const [isGenerating, setIsGenerating] = useState(false);
 	const [tokensPerSec, setTokensPerSec] = useState(null);
 	const [error, setError] = useState(() =>
-		initialRecoveryDetected ? UNCLEAN_RESTART_NOTICE : null,
+		!initialUnsupported && initialRecoveryDetected
+			? UNCLEAN_RESTART_NOTICE
+			: null,
 	);
 
 	const workerRef = useRef(null);
+	const workerCleanupRef = useRef(null);
 	const mountedRef = useRef(false);
+	const unsupportedDeviceRef = useRef(initialUnsupported);
+	const needsApprovalRef = useRef(false);
+	const modelCachedRef = useRef(null);
 	const lowMemoryRef = useRef(isLowMemoryDevice());
 	const storagePersistedRef = useRef(null);
 	const storagePersistRequestedRef = useRef(false);
@@ -755,21 +847,92 @@ export function useUltron() {
 
 	useEffect(() => {
 		mountedRef.current = true;
-		if (initialRecoveryDetected) {
-			clearInitRecoveryMarker();
-			recordCheckpoint("recovery_guard", {
-				error: UNCLEAN_RESTART_NOTICE,
+		let cancelled = false;
+
+		if (initialUnsupported) {
+			unsupportedDeviceRef.current = initialUnsupported;
+			recordCheckpoint("device_unsupported", {
+				error: initialUnsupported.reason,
 			});
+			return () => {
+				mountedRef.current = false;
+			};
 		}
 
-		const cleanup = attachWorker({ autoLoad: !initialRecoveryDetected });
+		(async () => {
+			let hasAdapter = false;
+			try {
+				hasAdapter = Boolean(await navigator.gpu?.requestAdapter());
+			} catch {
+				// Default remains false when WebGPU adapter lookup throws.
+			}
+
+			if (cancelled || !mountedRef.current) {
+				return;
+			}
+
+			if (!hasAdapter) {
+				const reason = {
+					code: "NO_WEBGPU_ADAPTER",
+					title: "WEBGPU ADAPTER UNAVAILABLE",
+					reason: "No compatible WebGPU graphics adapter was detected on this system. Model download (~814.5 MB) was blocked.",
+					requirement: "DESKTOP + WEBGPU",
+				};
+				unsupportedDeviceRef.current = reason;
+				setUnsupportedDevice(reason);
+				setIsLoadingModel(false);
+				setIsModelReady(false);
+				setError(null);
+				recordCheckpoint("device_unsupported", {
+					error: reason.reason,
+				});
+				return;
+			}
+
+			if (initialRecoveryDetected) {
+				clearInitRecoveryMarker();
+				recordCheckpoint("recovery_guard", {
+					error: UNCLEAN_RESTART_NOTICE,
+				});
+				workerCleanupRef.current = attachWorker({ autoLoad: false });
+				return;
+			}
+
+			const cached = await isModelCached();
+			if (cancelled || !mountedRef.current) {
+				return;
+			}
+
+			modelCachedRef.current = cached;
+
+			if (!cached) {
+				needsApprovalRef.current = true;
+				setNeedsDownloadApproval(true);
+				setIsLoadingModel(false);
+				recordCheckpoint("awaiting_download_approval");
+				return;
+			}
+
+			needsApprovalRef.current = false;
+			setNeedsDownloadApproval(false);
+			workerCleanupRef.current = attachWorker({ autoLoad: true });
+		})();
 
 		return () => {
+			cancelled = true;
 			mountedRef.current = false;
-			cleanup();
+			if (workerCleanupRef.current) {
+				workerCleanupRef.current();
+				workerCleanupRef.current = null;
+			}
 			lorePromiseRef.current = null;
 		};
-	}, [attachWorker, initialRecoveryDetected, recordCheckpoint]);
+	}, [
+		attachWorker,
+		initialRecoveryDetected,
+		initialUnsupported,
+		recordCheckpoint,
+	]);
 
 	const dispatchGeneration = useCallback(
 		async (historyWithUser, latestPrompt, generationOverrides) => {
@@ -854,6 +1017,7 @@ export function useUltron() {
 		async (text, generationOverrides) => {
 			const trimmed = typeof text === "string" ? text.trim() : "";
 			if (
+				unsupportedDeviceRef.current ||
 				!trimmed ||
 				isGeneratingRef.current ||
 				!isModelReadyRef.current ||
@@ -881,6 +1045,7 @@ export function useUltron() {
 	const regenerateLastResponse = useCallback(
 		async (generationOverrides) => {
 			if (
+				unsupportedDeviceRef.current ||
 				isGeneratingRef.current ||
 				!isModelReadyRef.current ||
 				!workerRef.current
@@ -964,7 +1129,35 @@ export function useUltron() {
 		recordCheckpoint("reset");
 	}, [clearActiveRequest, recordCheckpoint]);
 
+	const approveDownload = useCallback(() => {
+		if (unsupportedDeviceRef.current || !needsApprovalRef.current) {
+			return;
+		}
+
+		needsApprovalRef.current = false;
+		setNeedsDownloadApproval(false);
+		setIsLoadingModel(true);
+		setLoadProgress(0);
+		setError(null);
+		recordCheckpoint("download_approved");
+
+		if (workerRef.current) {
+			requestPersistentStorageOnce();
+			writeInitRecoveryMarker();
+			workerRef.current.postMessage({
+				type: "load",
+				lowMemory: lowMemoryRef.current,
+			});
+			return;
+		}
+
+		workerCleanupRef.current = attachWorker({ autoLoad: true });
+	}, [attachWorker, recordCheckpoint, requestPersistentStorageOnce]);
+
 	const reloadModel = useCallback(() => {
+		if (unsupportedDeviceRef.current) {
+			return;
+		}
 		const existingWorker = workerRef.current;
 
 		if (activeRequestIdRef.current) {
@@ -980,10 +1173,12 @@ export function useUltron() {
 
 		clearActiveRequest();
 		isModelReadyRef.current = false;
+		needsApprovalRef.current = false;
 		backendRef.current = null;
 		backendFallbackRef.current = false;
 		lastTokensPerSecRef.current = null;
 
+		setNeedsDownloadApproval(false);
 		setIsGenerating(false);
 		setIsModelReady(false);
 		setIsLoadingModel(true);
@@ -1015,7 +1210,7 @@ export function useUltron() {
 			}
 		}
 
-		attachWorker({ autoLoad: true });
+		workerCleanupRef.current = attachWorker({ autoLoad: true });
 	}, [
 		attachWorker,
 		clearActiveRequest,
@@ -1054,6 +1249,9 @@ export function useUltron() {
 				lastTokensPerSec: lastTokensPerSecRef.current,
 			},
 			environment: {
+				unsupportedDevice: unsupportedDeviceRef.current,
+				modelCachedOnBoot: modelCachedRef.current,
+				needsDownloadApproval: needsApprovalRef.current,
 				lowMemoryDevice: lowMemoryRef.current,
 				profile: lowMemoryRef.current ? "low-memory" : "standard",
 				storagePersisted: storagePersistedRef.current,
@@ -1077,6 +1275,9 @@ export function useUltron() {
 		loadProgress,
 		backend,
 		backendFallback,
+		unsupportedDevice,
+		isUnsupportedDevice: Boolean(unsupportedDevice),
+		needsDownloadApproval,
 		isGenerating,
 		tokensPerSec,
 		error,
@@ -1085,6 +1286,7 @@ export function useUltron() {
 		stopGeneration,
 		resetChat,
 		reloadModel,
+		approveDownload,
 		getBaselineSnapshot,
 	};
 }
